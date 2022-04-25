@@ -1,0 +1,243 @@
+---
+title: "Beta Binomial Regression - 3pt %"
+author: "Patrick Ward"
+date: "4/24/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  suppressWarnings({
+    library(tidyverse)
+    library(rvest)
+  })
+})
+
+theme_set(theme_minimal() +
+            theme(axis.text = element_text(face = "bold")))
+
+## Scrape 2021-2022 season --------------------------------------------------------------
+url2022 <- read_html("https://www.basketball-reference.com/leagues/NBA_2022_totals.html")
+
+tbl2022 <- html_nodes(url2022, 'table') %>%
+  html_table(fill = TRUE) %>%
+  pluck(1) %>%
+  janitor::clean_names() %>%
+  select("player", three_pt_att = "x3pa", three_pt_made = "x3p", three_pt_pct = "x3p_percent") %>%
+  filter(player != "Player") %>%
+  mutate(across(.cols = three_pt_att:three_pt_pct,
+                ~as.numeric(.x))) %>%
+  filter(!is.na(three_pt_pct)) %>%
+  arrange(desc(three_pt_pct))
+
+tbl2022 %>%
+  head()
+```
+
+
+## Plotting
+
+* Number of 3 pt attempts has an influence on a players 3pt%
+* As 3 pt attempts increase so does 3pt% -- Better 3 pt shooters take more 3 pt shots and their teams put them in position to take those shots
+
+
+```{r}
+tbl2022 %>%
+  ggplot(aes(x = three_pt_att, y = three_pt_pct)) +
+  geom_point() +
+  geom_smooth(method = "lm",
+              color = "red",
+              size = 1.2) +
+  scale_x_log10() +
+  labs(x = "3pt Att",
+       y = "3pt %",
+       title = "Relationship between 3pt Att and 3pt%",
+       subtitle = "Those with less attempts exhibit more variance",
+       caption = "Data Source: https://www.basketball-reference.com/leagues/NBA_2022_totals.html")
+```
+
+
+## Bayesian Shrinkage using Beta-Binomial Conjugate
+
+* alpha and beta parameters were previously established as 61.8 and 106.2, respectively, using data from the prior 2 seasons and players with 200 or more 3pt attempts. This provides a prior mean for 3pt% of 36.8%
+* The estimation of the alpha and beta parameters can be found [here](https://github.com/pw2/bases_adjusted_3pt_pct)
+
+Update each player using these parameters
+
+```{r}
+alpha <- 61.8
+beta <- 106.2
+
+prior_mu <- alpha / (alpha + beta)
+prior_mu
+
+tbl2022 <- tbl2022 %>%
+  mutate(three_pt_missed = three_pt_att - three_pt_made,
+         posterior_alpha = three_pt_made + alpha,
+         posterior_beta = three_pt_missed + beta,
+         posterior_three_pt_pct = posterior_alpha / (posterior_alpha + posterior_beta),
+         posterior_three_pt_sd = sqrt((posterior_alpha * posterior_beta) / ((posterior_alpha + posterior_beta)^2 * (posterior_alpha + posterior_beta + 1))))
+```
+
+
+Plot the posterior values on the same log scale
+
+```{r}
+tbl2022 %>%
+  dplyr::select(three_pt_att, three_pt_pct, posterior_three_pt_pct) %>%
+  pivot_longer(cols = three_pt_pct:posterior_three_pt_pct) %>%
+  mutate(name = factor(name, levels = c("three_pt_pct", "posterior_three_pt_pct"))) %>%
+  ggplot(aes(x = three_pt_att, y = value)) +
+  geom_jitter() +
+  geom_smooth(method = "lm",
+              color = "red",
+              size = 1.2) +
+  scale_x_log10() +
+  facet_wrap(~name)
+
+```
+
+
+* We've effectively constrained all of the players (shrinkage) towards the prior mean
+* Our problem is that the prior mean, 0.368, is too high for the players with a small number of 3pt shots. For example, the players with under 50 attempts have a 3pt % of 30% (median of 25%)
+
+
+```{r}
+tbl2022 %>%
+  filter(three_pt_att < 50) %>%
+  summarize(att = sum(three_pt_att),
+            three_pt = sum(three_pt_made),
+            three_pt_pct_avg = three_pt / att,
+            three_pt_pct_median = median(three_pt_pct))
+```
+
+
+* While the beta-binomial conjugate is using prior information to help us control for smaller observations and pool/shrink players to the average, those with a lower number of shot attempts are getting overestimated using this approach (IE, we might believe they are better than they really are!).
+* We need to account for shot attempts so that we can estimate players with smaller samples to a more proper prior (a prior lower than that being assumed by the alpha and beta parameters from the players with 200 or more three point attempts).
+
+
+## Accounting for 3pt Shot Attempts
+
+* Our outcome variable is binomial (success and failures) so we will use a beta-binomial regression to estimate a prior for 3pt% while controlling for 3pt shot attempts.
+
+```{r}
+suppressPackageStartupMessages({
+  suppressWarnings({
+    library(gamlss)
+  })
+})
+
+fit_3pt <- gamlss(cbind(three_pt_made, three_pt_missed) ~ log(three_pt_att),
+                  data = tbl2022,
+                  family = BB(mu.link = "identity"))
+
+fit_3pt
+
+## extract model coefficients
+fit_3pt$mu.coefficients
+fit_3pt$sigma.coefficients
+
+mu_intercept <- as.vector(fit_3pt$mu.coefficients[1])
+mu_shot <- as.vector(fit_3pt$mu.coefficients[2])
+sigma_shot <- as.vector(exp(fit_3pt$sigma.coefficients))
+```
+
+
+**Fitting an estimate to each player using our new prior that is accounting for 3 point shot attempts**
+
+* Instead of the single alpha and beta parameters we used before we will chose a prior for each player based on their number of 3 point shot attempts and then update their performance.
+* To use the equation for calculating a player's estimated 3pt%:
+
+$mu = mu.intercept + mu.shot*log(three.pt.att)$
+
+* Using the `predict()` function, we can have our model make this `mu` prediction for every player, representing their initial prior based on their 3 point shot attempts.
+
+**NOTE:** sigma will be the same for all players, representing the variance that we expect all of those in the population to similarly to exhibit.
+
+```{r}
+tbl2022 <- tbl2022 %>%
+  mutate(mu = fitted(fit_3pt, parameter = "mu"),
+         sigma = fitted(fit_3pt, parameter = "sigma"),
+         prior_alpha_reg = mu / sigma,
+         prior_beta_reg = (1 - mu) / sigma,
+         posterior_alpha_reg = prior_alpha_reg + three_pt_made,
+         posterior_beta_reg = prior_beta_reg + three_pt_missed,
+         posterior_mu_reg = posterior_alpha_reg / (posterior_alpha_reg + posterior_beta_reg))
+```
+
+
+**Plot the changes between our beta-binomial conjugate posterior and our beta-binomial regression posterior**
+
+```{r}
+tbl2022 %>%
+  ggplot(aes(x = posterior_three_pt_pct, y = posterior_mu_reg, color = three_pt_att)) +
+  geom_point() +
+  geom_abline(color = "red",
+              size = 1.3,
+              intercept = 0,
+              slope = 1) +
+  scale_color_continuous(type = 'viridis') +
+  labs(title = "Relationship between different Bayesian Estimates of 3pt%",
+       x = "3pt% using Beta(61.8, 106.2)",
+       y = "3pt% setting a prior using a beta-binomial regression")
+```
+
+
+* Notice that those with more 3 point attempts are close to the red line, representing perfect agreement between the two estimates(intercept = 0, slope = 1) while those with less attempts are pulled further down, indicating poorer estimated 3pt performance.
+
+
+**Plot the raw, beta-binomial conjugate, and beta-binomial regression outputs**
+
+```{r}
+tbl2022 %>%
+  dplyr::select(three_pt_att, three_pt_pct, posterior_three_pt_pct, posterior_mu_reg) %>%
+  pivot_longer(cols = three_pt_pct:posterior_mu_reg) %>%
+  mutate(name = factor(name, levels = c("three_pt_pct", "posterior_three_pt_pct", "posterior_mu_reg"))) %>%
+  ggplot(aes(x = three_pt_att, y = value)) +
+  geom_jitter() +
+  geom_smooth(method = "lm",
+              color = "red",
+              size = 1.2) +
+  scale_x_log10() +
+  facet_wrap(~name)
+```
+
+
+* In the right most plot (beta-binomial regression prior) we see those with a small number of 3pt attempts are shrunk to a smaller prior three point percentage than those with a larger number of 3pt attempts.
+
+
+## Make an estimation for a new player who has 10 three point attempts
+
+```{r}
+new_player <- data.frame(
+  three_pt_att = 10,
+  three_pt_made = 2,
+  three_pt_missed = 10 - 2,
+  three_pt_pct = 2 / 10
+)
+
+new_player %>%
+  mutate(mu = predict(fit_3pt, newdata = new_player),
+         sigma = exp(fit_3pt$sigma.coefficients),
+         prior_alpha = mu / sigma,
+         prior_beta = (1 - mu) / sigma,
+         posterior_alpha = prior_alpha + three_pt_made,
+         posterior_beta = prior_beta + three_pt_missed,
+         posterior_mu = posterior_alpha / (posterior_alpha + posterior_beta)) %>%
+  pivot_longer(cols = everything())
+
+```
+
+
+
+## Useful Resources
+
+Some textbooks that I've found useful for exploring this type of work:
+
+* [Introduction to Empirical Bayes: Examples from Baseball Statistics by David Robinson (this blog post was inspired by David's approach to batting statistics in Chapter 7)](https://www.amazon.com/Introduction-Empirical-Bayes-Examples-Statistics-ebook/dp/B06WP26J8Q/ref=sr_1_1?crid=3E0W5ZETS0HR9&keywords=david+robinson+empirical+bayes&qid=1650842197&sprefix=david+robinson+empirical+bayes%2Caps%2C340&sr=8-1)
+
+* [Bayesian Computation with R by Jim Albert](https://www.amazon.com/Bayesian-Computation-R-Use/dp/0387922970/ref=sr_1_1?keywords=bayesian+computation+with+r&qid=1650842246&sprefix=bayesian+comput%2Caps%2C150&sr=8-1)
+
+* [Bayesian Data Analysis by Gelman et al](https://www.amazon.com/Bayesian-Analysis-Chapman-Statistical-Science/dp/1439840954/ref=sr_1_1?crid=519JX5YHJBU5&keywords=Bayesian+Data+Analysis&qid=1650842283&sprefix=bayesian+data+analysis%2Caps%2C151&sr=8-1)
